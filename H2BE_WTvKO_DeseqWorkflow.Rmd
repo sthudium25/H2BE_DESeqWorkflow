@@ -1,0 +1,541 @@
+---
+title: "H2BE_WTKO_DeseqWorkflow"
+author: "Sam Thudium"
+date: "4/27/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(magrittr)
+```
+
+##Setting up for Deseq2
+
+###Why Deseq2?
+RNAseq is an extremely powerful tool for looking at changes in transcription across samples in an experiment.  However, due to common problems "small replicate numbers, discreteness, large dynamic range and the presence of outliers", the raw data that comes out of a sequencing run must be analyzed carefully. Deseq2 aims to overcome some of these problems.  
+
+Here we're going to walk through the analysis that I've been doing on H2BE WT and KO RNAseq. Some differential expression analysis has already been done on this dataset - the most interesting finding has been that a significant number of the downregulated genes are IEGs. I've tried to characterize the data some more and to pull out differences between WT and KO. 
+
+###Set-up
+Prior to going through this pipeline, the fastq files that come out of an RNAseq need to be mapped to a reference genome. We use Salmon to do this. The output file, called 'quant.sf', contains, most importantly, the name of each transcript that was successfully aligned, a computed effective length of the transcript, and an estimate of the number of copies of the transcript per million mapped reads (TPM). 
+
+There are a few files and R packages to set up before running this pipeline as well. This only needs to be done once per computer.
+
+``` {r}
+source("http://bioconductor.org/biocLite.R")
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("DESeq2")
+BiocManager::install("edgeR")
+BiocManager::install("GenomicFeatures")
+BiocManager::install("org.Mm.eg.db")
+install.packages("readr")
+library(GenomicFeatures)
+download.file("ftp://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_mouse/release_M19/gencode.vM19.annotation.gtf.gz", 
+              "gencode.vM19.annotation.gtf.gz")
+BiocManager::install("tximport")
+library("tximport")
+txdb_ms <- makeTxDbFromGFF("gencode.vM19.annotation.gtf.gz")
+saveDb(txdb_ms, file="gencode.vM19.sqlite")
+```
+
+Bioconductor is source for many tools to analyze high throughput genomics data. We install a few packages from there, and we also need to download a database containing transcript/gene name assignments so that we can identify the genes that appear in the RNAseq data. 
+
+Next, we load the required packages into R and build the dataframe of transcript and gene IDs:
+``` {r, message = FALSE}
+library("DESeq2")
+library("edgeR")
+library("tximport")
+library("readr")
+library(GenomicFeatures)
+
+txdb_ms <- loadDb("/Users/Sammy/Desktop/scripts/gencode.vM19.sqlite") 
+columns(txdb_ms)
+k <- keys(txdb_ms, keytype = "TXNAME")
+head(k)
+tx2gene <- AnnotationDbi::select(txdb_ms, k, "GENEID", "TXNAME") 
+#for every gene, tell me the transcripts that are associated with it
+head(tx2gene)
+```
+
+Now, we're ready to access the quant.sf files that contain the RNAseq data.  The directory to the files in a quants folder, which contains quant.sf files for each other the samples we want to analyze. 
+``` {r}
+dir <- file.path("/Volumes/LaCie/SequencingData/H2BE/old_brains/quants/")
+list.files(dir)
+(samplenames <- list.files(dir)) #this is the directory with my Salmon outputs and I wirte their names into a vector 
+```
+In this case, we only want samples 2-7, so we subset those sample names and change the order so that the WT samples are read in before the KO. This is important for Deseq2 to make the comparison that we want. The first set of samples will be the reference to which the second set will be compared. We also need to provide Deseq with some information about how to separate the samples we're analyzing. So, we create a dataframe with the sample names and an identifier "Treatment" for each sample. We then use this df to create paths to each of the quant.sf files.
+``` {r}
+samplenames_subset <- samplenames[c(5:7, 2:4)]
+
+(Treatment <- factor(c(rep("WT",3),rep("KO",3)), levels=c("WT","KO")))
+(colData <- data.frame(samplenames_subset, Treatment))
+
+files <- file.path(dir,colData$samplenames_subset,"quant.sf")
+names(files) <- colData$samplenames_subset
+head(files,6)
+```
+
+###Tximport
+Finally we're ready to read the files obtained from Salmon into R. One of the packages loaded at the beginning, "tximport", does just that. Here, you have some options about how to proceed with the analysis. In this case, we're specifying that we are reading in salomn files. tx2gene is the transcript to gene ID dataframe that we created at the beginning. countsFromAbundance let's you customize how the raw transcript reads in the salmon files should be normalized. This is important for normalizing to sequencing depth across samples. There are other options for this setting. Here, by setting tx2gene, we are telling R to aggregate transcripts that have the same gene ID. However, there are options for analyzing all transcripts individually if the experiment required it. 
+``` {r}
+head(tx2gene)
+txi<- tximport(files, type="salmon", 
+               tx2gene = tx2gene, 
+               countsFromAbundance = "lengthScaledTPM", 
+               ignoreAfterBar = TRUE)
+head(txi$counts)
+```
+
+
+##Running Deseq
+
+We're now ready to peform differential expression analysis using Deseq2. The first step is to build a DeseqDataSet. We use the txi object we just created as well as the identifying information contained in colData. The third arguement, "~ Treatment", tells Deseq how to design the experiment.  
+``` {r}
+colData
+Treatment
+dds <- DESeqDataSetFromTximport(txi, colData, ~ Treatment)
+head(dds)
+```
+
+The output is an object containing information about the counts for each gene in each sample. We can begin to look at these data in few ways. 
+
+###PCA
+
+PCA is a great way to look at the similarity of the samples. In order to compare the expression numbers across samples in a meaningful way, we need to transform the data so that genes with small counts are visible and those with large counts don't dominate whatever variance is present. The easiest way to visualize this is using a variance stabilized transformation (vst). 
+
+``` {r, message = FALSE}
+library(tidyverse)
+vst <- vst(dds, blind=FALSE)
+plotPCA(vst, intgroup = "Treatment")
+```
+
+You could also create a similar plot in ggplot2, which allows for more customization and layering of additional information. In this case the plots look identical but in experiments with more parameters than WT and KO, you could easily add those details here.  
+
+``` {r}
+vstPCA <- plotPCA(vst, intgroup = "Treatment", returnData = TRUE)
+percentVar <- round(100 * attr(vstPCA, "percentVar"))
+ggplot(vstPCA, aes(x = PC1, y = PC2, color = Treatment)) +
+  geom_point(size = 4) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance"))
+
+```
+
+##Differential Expression Analysis
+Before running DEA, we can clean up the DeseqDataSet a little bit. First, we'll remove the decimal portion of the gene IDs and then we will remove genes with really small counts because these likely don't have biological meaning put could easily appear statistically significant after analysis. 
+
+``` {r}
+head(dds)
+table(duplicated(substr(rownames(dds),1,18)))
+rownames(dds) <- make.unique(substr(rownames(dds),1,18)) 
+head(dds)
+
+dim(dds)
+dds <- dds[rowSums(counts(dds)) > 0,]
+keep_dds <- rowSums(counts(dds) >= 1) >= 3
+table(keep_dds)
+dds_over1 <- dds[keep_dds,] #filter them out
+dim(dds_over1)
+```
+
+This shrinks the dataset considerably, making the next step, in which Deseq performs DEA, faster. The DESeq function determines which genes are significantly differentially expressed. We then use results() to create a dataframe with useful information about these calcuations such as mean expression level, log2FoldChange, standard error, and adjusted pvalues. Summary gives a useful overview of the results table for genes with significant p.adj values, such as the number of genes upregulated/downregulated and outliers. 
+
+``` {r}
+dds_over1 <- DESeq(dds_over1)
+resultsNames(dds_over1)
+ResName <- resultsNames(dds_over1)
+ResName_input <- ResName[2]
+res_dds_over1 <- results(dds_over1, name = ResName_input)
+head(res_dds_over1)
+summary(res_dds_over1)
+```
+
+A common way to visualize the significantly DE genes is via a volcano plot. 
+``` {r}
+par("mar")
+par(mar=c(1,1,1,1))
+with(res_dds_over1, plot(log2FoldChange, -log10(pvalue), pch=20, main="Volcano plot", xlim=c(-5,5)))
+with(subset(res_dds_over1, padj<.05 ), points(log2FoldChange, -log10(pvalue), pch=20, col="red"))
+```
+It's also possible to create a volcano plot in ggplot2, which I think is much more intuitive and easy to work with than the cod above.  However, we first need to convet the results table into a tidy format.  This is easily done with the biobroom package. In this form, the data can be manipulated much more easily using tidyverse functions. 
+``` {r}
+library(biobroom)
+res_tidy <- tidy.DESeqResults(res_dds_over1)
+head(res_tidy)
+
+res_tidy %>% 
+  filter(!is.na(p.adjusted)) %>%
+  ggplot(aes(x = estimate, y = -log10(p.adjusted), color = p.adjusted < 0.05)) +
+    geom_point() +
+    xlim(c(-5, 5)) +
+    scale_color_manual(values = c("black","red")) +
+    ggtitle("Volcano Plot")
+  
+```
+
+##Augmenting the dataset
+
+###Separate Counts by Condition
+
+From here, you could extract subsets of data to perform other anlayses outside of R. However, getting back to the original goal of characterizing the H2BE WT/KO dataset, the defult results table in Deseq doesn't let us look at the underlying differences between the two genotypes. For example, the results table contains a column, "baseMean", which represents counts. Unfortunately this is a mean across __all__ samples. My goal was to separate this information out so that we could compare by genotype. Remembering back to the tximport funciton which read the salmon files for each of our sequencing runs, the output is a list containing three matrices: "abundance", "counts", and "length". Each of these lists has rows with the gene ID and columns with sample name. So, I needed to pull out this count data by condition (WT vs KO) and append that to the results table so that we could characterize more completely the relationship between genotypes. 
+
+``` {r}
+head(txi$counts)
+cts <- as_tibble(txi$counts, rownames = NA)
+cts <- rownames_to_column(cts)
+
+## Rename the columns so that they're easier to work with
+colnames(cts) <- c("GeneID", "WT.1", "WT.2", "WT.3", "KO.1", "KO.2", "KO.3")
+head(cts)
+```
+
+Gather the columns into a tidy format for easier manipulation. 
+``` {r}
+cts_tidy <- cts_tidy <- gather(cts, key = "sample", value = "count", -GeneID)
+head(cts_tidy)
+```
+
+Here, we add a column denoting which condition a sample is from. The first line will show either TRUE for samples containing "KO" and FALSE for those with "WT", but those levels can be renamed. 
+``` {r}
+cts_tidy <- cts_tidy %>%
+   mutate(condition = as.factor(grepl("KO.*", sample))) 
+
+levels(cts_tidy$condition) <- c("WT", "KO")
+```
+
+Now, we can perform calculations on different groupings of data. In this case, we want the mean counts per gene per condition, so we group on those variables and add a column, mean. Make sure to ungroup at the end or later use of functions may act weird. 
+
+``` {r}
+cts_tidy.2 <- cts_tidy %>%
+ group_by(condition, GeneID) %>%
+  mutate(mean = mean(count)) %>%
+  ungroup()
+```
+
+I think the next thing to do is to move the mean count data into a wider format so that the df has two columns WT and KO, underneath which you see the count (averaged across the three corresponding samples) per gene. This introduces NA values in, for example, the KO column of WT samples, but that's okay because they'll be removed later. 
+
+``` {r}
+cts_tidy.2 <- cts_tidy.2 %>%
+  pivot_wider(names_from = condition, values_from = mean) %>%
+  mutate(condition = as.factor(grepl("KO.*", sample)))
+
+levels(cts_tidy.2$condition) <- c("WT", "KO")
+  
+head(cts_tidy.2)
+tail(cts_tidy.2)
+cts_tidy.2 <- select(cts_tidy.2, -sample, -count)
+```
+
+Finally, the dataframe is split in two based on the value in the condition column and the decimal numbers on the GeneIDs are removed so that we can add Gene names later on. 
+``` {r}
+cts_split <- split(x = cts_tidy.2, f = cts_tidy.2$condition)
+
+cts_split$WT$GeneID <- make.unique(substr(cts_split$WT$GeneID, 1, 18))
+cts_split$KO$GeneID <- make.unique(substr(cts_split$KO$GeneID, 1, 18))
+head(cts_split)
+```
+
+The following code combines the results table we made earlier with the two lists of WT and KO counts created above.  It also selects for the columns we want to keep in the final table. 
+``` {r}
+res_cts_tidy <- res_tidy %>% 
+  left_join(cts_split$WT, by = c("gene" = "GeneID")) %>% 
+  left_join(cts_split$KO, by = c("gene" = "GeneID"), suffix = c("_WT", "_KO")) %>% 
+  select(-baseMean, log2FC = estimate, -condition_KO, -condition_WT, -KO_WT, -WT_KO,
+         WT_cts = WT_WT, KO_cts = KO_KO) %>%
+  pivot_longer(cols = WT_cts:KO_cts, 
+               names_to = "condition", 
+               names_ptypes = list(
+                 condition = factor()),
+               values_to = "count")
+head(res_cts_tidy)
+```
+
+To more easily understand the genes we're pulling out of this data, we can add the official gene names to each row. 
+``` {r, message = FALSE}
+geneIDs <- substr(res_cts_tidy$gene, 1, 18)
+library(org.Mm.eg.db)
+gene_symbols <- mapIds(org.Mm.eg.db, keys = geneIDs, column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+#add gene symbols as a new column to your res file
+res_cts_tidy$GeneSymbol <- gene_symbols
+res_cts_tidy_old <- res_cts_tidy[ ,c(1,9,2:8)]
+```
+
+And there we have a dataframe with all of the Deseq results as well as normalized expression values for each combination of gene and condition. Before moving on to using this table, one easy thing you can do to save a ton of time is to save this datafame as an r object file, or 'rda'. In the future, you can load this file and access the object without going through the hassle of executing all of this code. This will save to wherever your working directory is set. I added old to the end of the object name so that I can distiguish it from a similar object containing data from RNAseq in young H2BE WT/KO mice. 
+
+``` {r}
+save(res_cts_tidy_old, file = "rda/res_cts_tidy_old.rda")
+res_cts_tidy <- res_cts_tidy %>% 
+  mutate(quartile = ntile(log2FC, 4))
+```
+
+##Exploratory Data Analysis
+
+One of the first things we can do is look at the distribution of WT count values to determine a threshold for calling a gene "expressed".
+
+``` {r}
+res_cts_tidy %>%
+  filter(condition == "WT_cts") %>%
+  ggplot(aes(count)) +
+    geom_histogram(binwidth = 0.05) +
+    scale_x_log10() +
+    xlab("WT expression count distribution") +
+    geom_vline(xintercept = 1, color = "red") 
+```
+
+Create a box plot comparing the distributions of gene counts in WT and KO mice. This also adds a t-test with the pvalue of the difference between groups.
+``` {r, warning = FALSE}
+library(ggpubr)
+ggboxplot(res_cts_tidy, 
+            x = "condition", y = "count",
+            color = "condition", 
+            palette = "npg") +
+  stat_compare_means(method = "t.test", 
+                     label.x = 1.3) +
+  scale_y_log10()
+```
+
+Separate the data into quartiles of Log2FoldChange values and view how the gene counts in each compare. 
+``` {r, message = FALSE}
+library(cowplot)
+p1 <- res_cts_tidy  %>%
+  group_by(quartile) %>%
+  filter(condition == "WT_cts",
+         count > 1,
+         !is.na(GeneSymbol)) %>%
+  ggplot(aes(x = as.factor(quartile), y = count)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  ggtitle("WT counts vs KO Log2FC") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10)) +
+  labs(caption = "Binned as quartiles of KO Log2FC vs WT") 
+
+p2 <- res_cts_tidy %>%
+  filter(condition == "WT_cts",
+         count > 1,
+         p.adjusted < 0.05,
+         !is.na(GeneSymbol)) %>%
+  ggplot(aes(x = as.factor(quartile), y = count)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  ggtitle("WT counts vs Significant KO Log2FC") +
+  labs(caption = "NA GeneSymbols removed") +
+  theme(plot.title = element_text(hjust = 0.5,
+                                  size = 10))
+
+plot_grid(p1, p2)
+
+```
+
+One of the most interesting findings so far has been the comparison between young/old and WT/KO of genes that appear differentially expressed in the old brains dataset. The following dataframes contain the count data that we've been looking at for both H2BE WT/KO datasets (young and old). Then, I filtered those combined dataframes for the list of genes that appeared as significantly DE in the old brains dataset. 
+``` {r}
+load("~/Desktop/scripts/Github/Deseq2fromSalmonQuants_transcriptsUpdate/rda/H2beWTKO_YoungOld_downregGeneCounts.rda")
+load("~/Desktop/scripts/Github/Deseq2fromSalmonQuants_transcriptsUpdate/rda/H2beWTKO_YoungOld_upregGeneCounts.rda")
+```
+
+``` {r}
+library(forcats)
+p1 <- ggplot(upreg_gene, 
+            aes(x = fct_rev(WT), 
+                y = WT_ct, 
+                group = gene)) +
+   geom_point() +
+   geom_path() +
+   scale_y_continuous(trans = "log10", limits = c(1, 10000)) +
+   scale_x_discrete(labels = c("Young", "Old"), 
+                    expand = c(0.1, 0.1)) +
+   labs(title = "H2be WT Expression \n of Upregulated Genes",
+           x = "WT",
+           y = "Normalized TPM") +
+   theme_classic() +
+   theme(plot.title = element_text(hjust = 0.5)) 
+      
+p2 <- ggplot(upreg_gene,
+            aes(x = fct_rev(KO),
+                y = KO_ct,
+                group = gene)) +
+  geom_point() +
+  geom_path() +
+  scale_y_continuous(trans = "log10", 
+                     limits = c(1, 10000)) +
+  scale_x_discrete(labels = c("Young", "Old"), 
+                   expand = c(0.1, 0.1)) +
+  ggtitle("H2be KO Expression \n of Upregulated Genes") +
+  xlab("KO") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) 
+
+p4 <- plot_grid(p1, p2, rel_widths = c(1,0.85))
+ggdraw(add_sub(p4, "Welch Two Sample t-test; \n WT: ns; KO: ns", size = 8, x = 0.82))
+```
+
+Filtering for genes significantly down regulated in old brains.
+``` {r}
+p4 <- ggplot(downreg_gene, 
+             aes(x = fct_rev(WT), 
+                 y = WT_ct, 
+                 group = gene)) +
+  geom_point() +
+  geom_path(na.rm = TRUE) +
+  scale_y_continuous(trans = "log10", limits = c(1, 10000)) +
+  scale_x_discrete(labels = c("Young", "Old"), expand = c(0.1, 0.1)) +
+  ggtitle("H2be WT Expression \n of Downregulated Genes") +
+  xlab("WT") +
+  ylab("Normalized TPM") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+p5 <- ggplot(downreg_gene,
+             aes(x = fct_rev(KO),
+                 y = KO_ct,
+                 group = gene)) +
+  geom_point(na.rm = TRUE) +
+  geom_line(na.rm = TRUE) +
+  scale_y_continuous(trans = "log10", limits = c(1, 10000)) +
+  scale_x_discrete(labels = c("Young", "Old"), 
+                   expand = c(0.1, 0.1)) +
+  ggtitle("H2be KO Expression \n of Downregulated Genes") +
+  xlab("KO") +
+  ylab("Normalized TPM") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+      axis.title.y = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()) 
+
+p6 <- plot_grid(p4, p5, rel_widths = c(1,0.85))
+ggdraw(add_sub(p6, "Welch Two Sample t-test; \n WT: ns; KO: p-value = 4.764e-06", size = 8, x = 0.82))
+
+```
+
+Finally, just as we separated the count data by condition, we can separate the gene length data that is pulled into R from Salmon.  The rational behind this came out of the observation that a number of the genes that are DE in the old brain dataset are IEGs, which tend to be short. So, we wanted to see more empirically how the gene lengths of up regulated and down regulated genes compared to the lengths of the global population of expressed genes. So I went through the same process, this time calculating a mean gene length per gene per condition. 
+``` {r}
+load("~/Desktop/scripts/Github/Deseq2fromSalmonQuants_transcriptsUpdate/rda/res_cts_tidy_oldEffLength.rda")
+head(res_length)
+```
+
+The Effective gene length by condition may be slightly different due to how the data is pulled from Salmon. However, we would not expect there to be an over all difference between the two groups. And indeed, that's what we see:
+``` {r}
+res_length %>%
+  filter(EffLength > 100) %>%
+  ggboxplot(x = "condition", y = "EffLength",
+            color = "condition", 
+            palette = "npg") +
+  stat_compare_means(method = "t.test", 
+                     label.x = 1.3) +
+  scale_y_log10() +
+  labs(caption = "Excluding mapped genes < 100bp")
+```
+
+A more interesting approach is to comparte subsets of WT gene lengths to all WT gene lengths.
+``` {r}
+load("~/Desktop/scripts/Github/Deseq2fromSalmonQuants_transcriptsUpdate/rda/res_length_signifOld.rda")
+
+len_up <- len_signif %>%
+  filter(log2FC > 0)
+
+len_down <- len_signif %>%
+  filter(log2FC < 0)
+
+allWTlen <- res_length %>%
+  filter(condition == "WT_len",
+         !is.na(GeneSymbol),
+         EffLength > 100)
+levels(allWTlen$condition) <- c("All_WT", "null")
+```
+
+Global WT gene length distribution can easily be compared to the lengths of up regulated genes using a boxplot:
+``` {r}
+ggplot() +
+  geom_boxplot(data = allWTlen,
+               aes(x = condition, y = EffLength),
+               width = 0.6) +
+  geom_boxplot(data = len_up, 
+               aes(x = condition, y = EffLength),
+               color = "red",
+               width = 0.6) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c("All WT Genes", "DE Up Genes")) +
+  labs(title = "Effective Gene Length of Significantly Upregulated Genes \n Increases Compared to All WT Genes",
+      y = "Effective Gene Length",
+      caption = 'Two sample t-test: p-value = 0.001') +
+  theme_classic() +
+  theme(axis.title.x = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.text = element_text(size = 9, color = "black"),
+    axis.ticks.x = element_blank())
+```
+Or and ECDF plot:
+``` {r}
+ggplot()+
+  stat_ecdf(data = allWTlen,
+            aes(x = EffLength, color = condition)) +
+  stat_ecdf(data = len_up, 
+            aes(x = EffLength, color = condition)) +
+  scale_x_log10() +
+  scale_color_manual(name = "Gene group",
+                     labels = c("All WT Genes",
+                                "DE Up Genes"),
+                     values = c("All_WT" = "black",
+                                "WT_len" = "red")) +
+  labs(title = "DE Up Genes Shift Longer Than All WT genes",
+       x = "Effective length",
+       y = "Fraction of data") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12),
+        axis.text = element_text(size = 9, color = "black"),
+        axis.ticks = element_blank(),
+        axis.title.x = element_text(vjust = -0.7),
+        axis.title.y = element_text(vjust = 2)) 
+```
+
+In both cases, there is a slight preference for longer genes.
+
+We see the opposite for the lengths of down regulated genes in comparison to the lengths of all genes. 
+``` {r}
+ggplot() +
+  geom_boxplot(data = allWTlen,
+               aes(x = condition, y = EffLength),
+               width = 0.6) +
+  geom_boxplot(data = len_down, 
+               aes(x = condition, y = EffLength),
+               color = "red",
+               width = 0.6) +
+  scale_y_log10() +
+  scale_x_discrete(labels = c("All WT Genes", "DE Down Genes")) +
+  labs(title = "Effective Gene Length of Significantly Downregulated Genes \n Increases Compared to All WT Genes",
+       y = "Effective Gene Length",
+       caption = 'Welch Two sample t-test: p-value = 3.08e-14') +
+  theme_classic() +
+  theme(axis.title.x = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 12),
+        axis.text = element_text(size = 9, color = "black"),
+        axis.ticks.x = element_blank())
+#Or
+
+ggplot()+
+  stat_ecdf(data = allWTlen,
+            aes(x = EffLength, color = condition)) +
+  stat_ecdf(data = len_down, 
+            aes(x = EffLength, color = condition)) +
+  scale_x_log10() +
+  scale_color_manual(name = "Gene group",
+                     labels = c("All WT Genes",
+                                "DE Down Genes"),
+                     values = c("All_WT" = "black",
+                                "WT_len" = "red")) +
+  labs(title = "DE Down Genes Shift Shorter Than All WT genes",
+       x = "Effective length",
+       y = "Fraction of data") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12),
+        axis.text = element_text(size = 9, color = "black"),
+        axis.ticks = element_blank(),
+        axis.title.x = element_text(vjust = -0.7),
+        axis.title.y = element_text(vjust = 2))
+```
